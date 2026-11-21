@@ -1,6 +1,21 @@
+"""
+SmartSeat dashboard - University of Debrecen.
+
+Run:  streamlit run app.py
+
+This file is the whole dashboard. It is meant to be integrated with the
+team's SQLite database and YOLO pipeline by editing ONLY:
+
+  1. the "SYSTEM CONFIGURATION" block (table names, capacity, layout), and
+  2. the three functions in the "INTEGRATION POINTS" block, if the team's
+     database module uses different names.
+
+With no database module present, the dashboard still runs on clearly
+labelled sample data. See README.md for the full integration guide.
+"""
+
 import base64
 import io
-import os
 import re
 import time
 from collections import Counter
@@ -11,10 +26,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# The team's database module (SQLite). Optional: if it is missing, the
+# dashboard falls back to sample data and says so on screen.
 try:
-    import db
+    import smartseat_db
 except ImportError:
-    db = None
+    smartseat_db = None
 
 # ==========================================
 # PAGE SETUP
@@ -46,28 +63,21 @@ CAMERA_CONNECTED = False
 DETECTION_STATUS = "Awaiting integration"
 LAST_DETECTION_UPDATE = None    # a datetime once real data is loaded
 
-# db.py does not store WHERE a reading came from, so say it here.
-#   "demo"   = invented rows from `python db.py --seed-demo`
-#   "replay" = readings from recorded images
-#   "live"   = the detection process is writing fresh readings from a camera
-# Change it in this file or with the environment variable SMARTSEAT_SOURCE.
-DB_DATA_SOURCE = os.environ.get("SMARTSEAT_SOURCE", "replay").strip().lower()
-if DB_DATA_SOURCE not in ("demo", "replay", "live"):
-    DB_DATA_SOURCE = "replay"
-
 # Live data older than this many seconds is shown as STALE.
 STALE_AFTER_SECONDS = 120
 
-# Find Available Seats: the time window is set in db.py (WINDOW_MINUTES).
-AVAILABILITY_WINDOW_MINUTES = getattr(db, "WINDOW_MINUTES", 60)
+# Find Available Seats looks this many minutes either side of the time.
+AVAILABILITY_WINDOW_MINUTES = 15
 
-# With fewer past readings than this, no forecast number is shown.
-MIN_FORECAST_READINGS = 3
-
+# Optional room opening hours for Find Available Seats, e.g. dtime(8, 0).
+# None = unknown, so no opening-hours check is made.
 OPENING_TIME = None
 CLOSING_TIME = None
 
-
+# The monitored tables, numbered as in the room photo (left to right,
+# top to bottom). The detector may write "Table 1" or "Table 01": names
+# are matched by their number.
+# Sample counts below were counted by eye from that photo, for demo only.
 DEFAULT_TABLE_DATA = {
     "Table 01": 1,
     "Table 02": 1,
@@ -79,9 +89,12 @@ DEFAULT_TABLE_DATA = {
     "Table 08": 1
 }
 
-
+# Chairs per table. The photo shows four per table (two on each long
+# side). Please confirm this against the real room.
 TABLE_CAPACITY = {name: 4 for name in DEFAULT_TABLE_DATA}
 
+# Where each table is drawn on the map: (left %, top %) inside the room
+# box. Schematic only, based on the room photo, not to scale.
 TABLE_LAYOUT = {
     "Table 01": (3, 5),      # top row, left column
     "Table 02": (37, 5),     # top row, middle column
@@ -95,9 +108,21 @@ TABLE_LAYOUT = {
 
 TABLE_BOX_WIDTH = 26         # width of each table box, % of the room box
 
-
+# Height in pixels of the table map AND of the room photo beside it, so
+# the two line up. Change this one number to make both taller or shorter.
 MAP_HEIGHT = 460
 
+# VIDEO MODE. If a video named like this sits next to app.py (or in
+# assets/), the Overview analyses it with the team's YOLO module and the
+# picture and the map follow a time slider. Set False to use the photo only.
+USE_VIDEO_FOR_OVERVIEW = True
+ROOM_VIDEO_NAMES = ("room.mp4", "room.mov", "room.avi", "room.mkv")
+VIDEO_SUFFIXES = (".mp4", ".mov", ".avi", ".mkv", ".m4v")
+VIDEO_SAMPLE_SECONDS = 1     # look at one frame about every second
+VIDEO_MAX_FRAMES = 30        # never analyse more than this many frames
+
+# The room photo shown on the Overview page. The first file found, next
+# to app.py or inside the assets folder, is used.
 ROOM_IMAGE_NAMES = (
     "room.jpg", "room.jpeg", "room.png", "room.jpg.jpeg"
 )
@@ -129,7 +154,7 @@ DATA_SOURCE_TEXT = {
 
 DATA_MODE_TEXT = {
     "demo": "Demonstration data",
-    "replay": "Replay of recorded images",
+    "replay": "Replay of recorded video or images",
     "live": "Live detections"
 }
 
@@ -208,8 +233,18 @@ else:
 data_problems = []
 
 
-def to_local_naive(value):
+# ==========================================
+# INTEGRATION POINTS
+# The team leader wires the real database here.
+# Everything else in the app uses only these three functions.
+# ==========================================
 
+def to_local_naive(value):
+    """Turn a datetime or ISO text into a local datetime without time zone.
+
+    Times with a time zone (for example ending in Z) are converted to the
+    computer's local time, so ages and stale checks stay correct.
+    """
     if value is None:
         return None
 
@@ -236,143 +271,272 @@ def canonical_table_name(name):
     return f"Table {int(match.group(1)):02d}"
 
 
-# ==========================================
-# DATABASE ACCESS (db.py)
-# ==========================================
-
 def load_latest_snapshot():
-    """Newest table reading from db.get_latest_tables().
+    """INTEGRATION POINT 1: the most recent detection result.
 
-    db.py stores only the FREE seats of each table, so the number of
-    people is worked out here: people = seats per table - free seats.
-    Returns {"counts": {"Table 01": people, ...}, "timestamp": ...,
-    "source": ...} or None.
+    Calls smartseat_db.latest_snapshot(). It must return None when there is
+    no data, or a dictionary:
+        {
+          "counts": {"Table 01": 2, "Table 02": 0, ... "Table 08": 1},
+          "source": "replay" or "live",
+          "timestamp": datetime or ISO text
+        }
+    Table names are matched by their number, so "Table 1" and "Table 01"
+    both mean Table 01.
     """
-
-    if db is None:
+    if smartseat_db is None:
         return None
 
-    reader = getattr(db, "get_latest_tables", None)
+    reader = getattr(smartseat_db, "latest_snapshot", None)
 
     if reader is None:
         data_problems.append(
-            "db.py has no get_latest_tables() function, "
+            "smartseat_db has no latest_snapshot() function, "
             "so sample data is shown."
         )
         return None
 
     try:
-        latest = reader()
+        return reader()
     except Exception as error:
         data_problems.append(f"Could not read the latest snapshot: {error}")
         return None
 
-    if not latest or not latest.get("tables"):
-        return None
-
-    seats = getattr(db, "SEATS_PER_TABLE", 4)
-    counts = {}
-
-    for entry in latest["tables"]:
-        try:
-            name = f"Table {int(entry['table']):02d}"
-            counts[name] = max(0, seats - int(entry["free"]))
-        except (KeyError, TypeError, ValueError):
-            data_problems.append(
-                f"Skipped an unreadable table entry: {entry}"
-            )
-
-    if not counts:
-        return None
-
-    return {
-        "counts": counts,
-        "timestamp": latest.get("taken_at"),
-        "source": DB_DATA_SOURCE,
-    }
-
 
 def load_history():
-    """History for the trend chart, from db.get_history().
+    """INTEGRATION POINT 2: one reading per stored snapshot, for the chart.
 
-    db.py stores the room's free-seat percentage, so people detected is
-    worked out from it: capacity x (1 - free share).
-    Returns (rows, problem_text_or_None), oldest first.
+    Calls smartseat_db.history_totals(). It must return a list of
+    dictionaries (oldest first):
+        {"time": datetime or ISO text, "source": "live" or "replay",
+         "people_detected": 17}
+    Returns (rows, problem_text_or_None).
     """
-
-    if db is None:
+    if smartseat_db is None:
         return [], None
 
-    reader = getattr(db, "get_history", None)
+    reader = getattr(smartseat_db, "history_totals", None)
 
     if reader is None:
-        return [], "db.py has no get_history() function."
+        return [], "smartseat_db has no history_totals() function."
 
     try:
-        rows = reader(limit=500)
+        return list(reader()), None
     except Exception as error:
         return [], f"Could not read the history: {error}"
 
-    total_seats = sum(TABLE_CAPACITY.values())
 
-    history = []
-    for row in rows:
-        try:
-            free_share = float(row["availability_percent"]) / 100
-            history.append({
-                "time": row["taken_at"],
-                "source": DB_DATA_SOURCE,
-                "people_detected": round(total_seats * (1 - free_share)),
-            })
-        except (KeyError, TypeError, ValueError):
-            continue
+def load_availability(weekday, visit_time, seats_needed):
+    """INTEGRATION POINT 3: the availability forecast.
 
-    return history, None
+    Calls smartseat_db.predict_availability(weekday, visit_time,
+    seats_needed, window_minutes), where
+        weekday      0 = Monday ... 6 = Sunday (Python's date.weekday())
+        visit_time   a datetime.time
+        seats_needed free seats wanted together at ONE table
+        window_minutes  look this far either side of visit_time
+    It returns a dictionary (or just the probability number):
+        {"probability": 0.62 or None, "readings_used": 14,
+         "days_covered": 5, "source": "live"/"replay"/"demo"}
+    probability is between 0 and 1. None means not enough history.
+    Meaning: the share of past snapshots, on that weekday within the time
+    window, where at least one table had `seats_needed` free seats
+    (rated capacity minus people detected).
 
-
-def load_availability(visit_moment):
-    """Forecast from db.predict_availability(date_time).
-
-    db.py returns (average free-seat percent, number of readings).
-    This always returns a dictionary with a "status":
+    This function always returns a dictionary with a "status":
     ok, not_enough_data, not_connected or error.
-    "free_share" is between 0 and 1.
     """
-
-    function = getattr(db, "predict_availability", None) if db else None
+    function = (
+        getattr(smartseat_db, "predict_availability", None)
+        if smartseat_db is not None else None
+    )
 
     if function is None:
         return {"status": "not_connected"}
 
     try:
-        average, samples = function(visit_moment)
+        raw = function(
+            weekday, visit_time, seats_needed, AVAILABILITY_WINDOW_MINUTES
+        )
     except Exception as error:
         return {"status": "error", "message": str(error)}
 
-    details = {
-        "readings_used": samples,
-        "days_covered": None,
-        "source": DB_DATA_SOURCE,
-    }
+    if isinstance(raw, dict):
+        probability = raw.get("probability")
+        details = {
+            "readings_used": raw.get("readings_used"),
+            "days_covered": raw.get("days_covered"),
+            "source": raw.get("source"),
+        }
+    else:
+        probability = raw
+        details = {
+            "readings_used": None, "days_covered": None, "source": None
+        }
 
-    if average is None or samples < MIN_FORECAST_READINGS:
+    if probability is None:
         return {"status": "not_enough_data", **details}
 
     try:
-        average = float(average)
+        probability = float(probability)
     except (TypeError, ValueError):
         return {
             "status": "error",
             "message": "The forecast function did not return a number."
         }
 
-    if not 0 <= average <= 100:
+    if not 0 <= probability <= 1:
         return {
             "status": "error",
-            "message": "The availability must be between 0 and 100."
+            "message": "The probability must be between 0 and 1."
         }
 
-    return {"status": "ok", "free_share": average / 100, **details}
+    return {"status": "ok", "probability": probability, **details}
+
+
+# ==========================================
+# VIDEO ANALYSIS (runs before the data is chosen)
+# ==========================================
+
+def to_data_uri(picture):
+    """Shrink a PIL picture and return it as text a web page can show."""
+    picture = picture.convert("RGB")
+    picture.thumbnail((1100, 1100))
+
+    buffer = io.BytesIO()
+    picture.save(buffer, format="JPEG", quality=85)
+
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    return "data:image/jpeg;base64," + encoded
+
+
+def find_room_video():
+    """The room video: a file named room.mp4 (or similar) first, otherwise
+    the first video file of any name next to app.py or in assets/."""
+    base = Path(__file__).parent
+    folders = (base, base / "assets")
+
+    for folder in folders:
+        for filename in ROOM_VIDEO_NAMES:
+            candidate = folder / filename
+            if candidate.exists():
+                return candidate
+
+    for folder in folders:
+        if folder.is_dir():
+            for candidate in sorted(folder.iterdir()):
+                if candidate.suffix.lower() in VIDEO_SUFFIXES:
+                    return candidate
+
+    return None
+
+
+def counts_from_details(details):
+    """Turn the team's YOLO details into {'Table 01': people, ...}.
+
+    ASSUMPTION: details['tables'] lists the tables in order, Table 01 to
+    Table 08, each with a 'people' count. If every entry also has a
+    'name', 'table' or 'id', that is used instead of the order.
+    """
+    tables = details.get("tables") or []
+    names = list(DEFAULT_TABLE_DATA)
+
+    if len(tables) != len(names):
+        raise ValueError(
+            f"YOLO returned {len(tables)} tables but the dashboard has "
+            f"{len(names)}."
+        )
+
+    labels = [
+        t.get("name") or t.get("table") or t.get("id") for t in tables
+    ]
+
+    if all(label is not None for label in labels):
+        names = [canonical_table_name(label) for label in labels]
+
+    return {
+        name: max(0, int(table.get("people", 0)))
+        for name, table in zip(names, tables)
+    }
+
+
+@st.cache_data(show_spinner="Analysing the video with YOLO (first load only)...")
+def analyse_room_video(path_text, modified_time, every_seconds, max_frames):
+    """Run the team's YOLO module on frames sampled from the video.
+
+    Returns a list of {'second', 'counts', 'uri'}: the time in the video,
+    the people per table, and the frame with detections drawn on it.
+    Needs OpenCV and the team's processing.process_image(frame), which
+    returns (annotated_frame_in_BGR, details). The imports are inside the
+    function so the dashboard starts normally without them.
+    """
+    import cv2
+    import processing
+    from PIL import Image
+
+    video = cv2.VideoCapture(path_text)
+
+    if not video.isOpened():
+        raise ValueError("The video could not be opened.")
+
+    fps = video.get(cv2.CAP_PROP_FPS) or 25
+    total_frames = video.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    duration = total_frames / fps if total_frames else 0
+
+    # Spread the frames over the whole video, but never closer than
+    # every_seconds, and never more than max_frames in total.
+    interval = max(every_seconds, duration / max_frames)
+    step = max(1, int(round(fps * interval)))
+
+    frames = []
+    frame_number = 0
+
+    while len(frames) < max_frames:
+        video.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ok, frame = video.read()
+
+        if not ok:
+            break
+
+        annotated, details = processing.process_image(frame)
+        rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+        frames.append({
+            "second": round(frame_number / fps, 1),
+            "counts": counts_from_details(details),
+            "uri": to_data_uri(Image.fromarray(rgb)),
+        })
+
+        frame_number += step
+
+    video.release()
+
+    if not frames:
+        raise ValueError("No frames could be read from the video.")
+
+    return frames
+
+
+def load_video_frames():
+    """Returns (frames, problem). No frames and no problem means there is
+    no video, or YOLO is not installed here, which is fine."""
+    video = find_room_video()
+
+    if video is None:
+        return [], None
+
+    try:
+        return analyse_room_video(
+            str(video), video.stat().st_mtime,
+            VIDEO_SAMPLE_SECONDS, VIDEO_MAX_FRAMES
+        ), None
+    except ImportError:
+        return [], None
+    except Exception as error:
+        return [], (
+            "The video could not be analysed with YOLO, so other data is "
+            f"shown: {error}"
+        )
 
 
 # ==========================================
@@ -381,6 +545,37 @@ def load_availability(visit_moment):
 
 snapshot = load_latest_snapshot()
 use_snapshot = False
+
+# The menu choice, read early so the video is only analysed on the Overview.
+current_page = st.session_state.get("nav_page", "Overview")
+
+video_path = find_room_video() if USE_VIDEO_FOR_OVERVIEW else None
+video_frames, video_problem = [], None
+chosen_frame = None
+video_in_use = False
+
+if video_path is not None and current_page == "Overview":
+    video_frames, video_problem = load_video_frames()
+
+if video_problem:
+    data_problems.append(video_problem)
+
+if video_frames:
+    video_seconds = [frame["second"] for frame in video_frames]
+
+    if st.session_state.get("video_second") not in video_seconds:
+        st.session_state.pop("video_second", None)
+
+    wanted_second = st.session_state.get("video_second", video_seconds[0])
+    chosen_frame = video_frames[video_seconds.index(wanted_second)]
+
+    # The video replaces any stored snapshot while it is in use.
+    snapshot = {
+        "counts": chosen_frame["counts"],
+        "source": "replay",
+        "timestamp": None,
+    }
+    video_in_use = True
 
 if snapshot:
     configured = list(DEFAULT_TABLE_DATA)
@@ -428,15 +623,14 @@ if snapshot:
                 data_problems.append(f"Invalid count for {name}, shown as 0.")
 
         DATA_SOURCE = snapshot.get("source", "replay")
-        if DATA_SOURCE not in DATA_SOURCE_TEXT:
+        if DATA_SOURCE not in DATA_SOURCE_TEXT or DATA_SOURCE == "demo":
             DATA_SOURCE = "replay"
 
         LAST_DETECTION_UPDATE = to_local_naive(snapshot.get("timestamp"))
-        DETECTION_STATUS = {
-            "live": "Running",
-            "replay": "Replay of recorded images",
-            "demo": "Demonstration data",
-        }[DATA_SOURCE]
+        DETECTION_STATUS = (
+            "Running" if DATA_SOURCE == "live"
+            else "Replay of recorded images"
+        )
 
 if not use_snapshot:
     table_data = dict(st.session_state.table_data)
@@ -456,6 +650,9 @@ if DATA_SOURCE == "live":
 
 if data_is_stale:
     DETECTION_STATUS = "No recent update"
+
+if video_in_use:
+    DETECTION_STATUS = "Replay of a recorded video"
 
 CAMERA_CONNECTED = DATA_SOURCE == "live" and not data_is_stale
 
@@ -544,6 +741,8 @@ def camera_badge():
 
 
 def last_update_text():
+    if video_in_use:
+        return f"Video frame at {chosen_frame['second']:.0f} s"
     if LAST_DETECTION_UPDATE is None:
         return "No live update"
     return (
@@ -611,7 +810,7 @@ def display_demo_notice():
         )
     elif DATA_SOURCE == "replay":
         st.info(
-            "Replay mode: Values come from recorded images "
+            "Replay mode: Values come from a recorded video or images "
             "processed by the detection system, not a live camera."
         )
 
@@ -722,18 +921,6 @@ def run_yolo_on_photo(path_text, modified_time):
     return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), details
 
 
-def to_data_uri(picture):
-    """Shrink a PIL picture and return it as text a web page can show."""
-    picture = picture.convert("RGB")
-    picture.thumbnail((1100, 1100))
-
-    buffer = io.BytesIO()
-    picture.save(buffer, format="JPEG", quality=85)
-
-    encoded = base64.b64encode(buffer.getvalue()).decode()
-    return "data:image/jpeg;base64," + encoded
-
-
 @st.cache_data(show_spinner=False)
 def plain_photo_uri(path_text, modified_time):
     from PIL import Image
@@ -753,12 +940,44 @@ def display_room_overview():
     Shows the YOLO detections if the team's module is available, and the
     plain photo otherwise.
     """
+    if video_in_use:
+        st.html(
+            f'<img src="{chosen_frame["uri"]}" alt="Study room video frame" '
+            f'style="display:block;width:100%;height:{MAP_HEIGHT}px;'
+            f'object-fit:cover;border-radius:12px;'
+            f'border:1px solid {LINE};">'
+        )
+        st.caption(
+            f"Video frame at {chosen_frame['second']:.0f} s, "
+            "with YOLO detections"
+        )
+
+        with st.expander("Play the original video"):
+            st.video(str(video_path))
+        return
+
+    if video_path is not None:
+        # Streamlit cannot size st.video, so this style makes the player
+        # MAP_HEIGHT pixels tall, the same as the map beside it.
+        st.markdown(
+            f"<style>video.stVideo {{ height: {MAP_HEIGHT}px; "
+            "width: 100%; object-fit: cover; border-radius: 12px; }}"
+            "</style>",
+            unsafe_allow_html=True
+        )
+        st.video(str(video_path))
+        st.caption(
+            "Recorded video. YOLO is not available here, so no "
+            "detections are drawn."
+        )
+        return
+
     photo = find_room_image()
 
     if photo is None:
         st.warning(
-            "Room photo not found. Put room.jpg next to app.py "
-            "(or in the assets folder)."
+            "Room photo or video not found. Put room.mp4 (or room.jpg) "
+            "next to app.py, or in the assets folder."
         )
         return
 
@@ -791,6 +1010,13 @@ def display_room_overview():
     if problem:
         st.warning(problem)
 
+    if USE_VIDEO_FOR_OVERVIEW and video_path is None:
+        st.caption(
+            "No video found, so the photo is shown. Put a video such as "
+            "room.mp4 in this folder: "
+            f"{Path(__file__).parent}  (or in its assets folder)."
+        )
+
 
 # ==========================================
 # FIND AVAILABLE SEATS (forecast card)
@@ -812,7 +1038,7 @@ def forecast_message_card(badge_text, title, message, kind="off"):
     """)
 
 
-def display_visit_forecast(visit_date, visit_time):
+def display_visit_forecast(visit_date, visit_time, seats_needed):
     """Check the request, ask the database, and draw the right card."""
 
     visit_moment = datetime.combine(visit_date, visit_time)
@@ -838,14 +1064,16 @@ def display_visit_forecast(visit_date, visit_time):
         return
 
     # 2. Ask the database.
-    forecast = load_availability(visit_moment)
+    forecast = load_availability(
+        visit_date.weekday(), visit_time, seats_needed
+    )
     status = forecast["status"]
 
     if status == "not_connected":
         forecast_message_card(
             "NOT CONNECTED", "Availability data is not connected yet",
-            "db.py or its predict_availability() function was not found, "
-            "so no number is shown."
+            "The database forecast function is not connected, so no "
+            "number is shown."
         )
         return
 
@@ -866,7 +1094,7 @@ def display_visit_forecast(visit_date, visit_time):
         forecast_message_card(
             "NO FORECAST", "Not enough history yet",
             f"There are too few past readings for {weekday_name}s around "
-            f"{visit_time:%H:%M} to estimate availability, so "
+            f"{visit_time:%H:%M} to estimate {seats_needed} seat(s), so "
             f"no number is shown.{extra}"
         )
         return
@@ -875,19 +1103,15 @@ def display_visit_forecast(visit_date, visit_time):
     window = AVAILABILITY_WINDOW_MINUTES
     start = (visit_moment - timedelta(minutes=window)).strftime("%H:%M")
     end = (visit_moment + timedelta(minutes=window)).strftime("%H:%M")
-    percent = round(forecast["free_share"] * 100)
-
-    all_seats = sum(TABLE_CAPACITY.values())
-    expected_free = round(forecast["free_share"] * all_seats)
+    percent = round(forecast["probability"] * 100)
 
     sources = {
         "live": ("LIVE DATA", "ok"),
         "replay": ("REPLAY DATA", "demo"),
         "demo": ("DEMO DATA", "demo"),
     }
-    source_html = (
-        status_badge(*sources[forecast["source"]])
-        if forecast.get("source") in sources else ""
+    source_text, source_kind = sources.get(
+        forecast.get("source"), ("SOURCE NOT STATED", "off")
     )
 
     based_on = ""
@@ -906,10 +1130,11 @@ def display_visit_forecast(visit_date, visit_time):
         <div style="display:flex;justify-content:space-between;
                     align-items:center;">
             <div class="smartseat-panel-title">Estimated availability</div>
-            <div>{source_html}</div>
+            <div>{status_badge(source_text, source_kind)}</div>
         </div>
         <div class="smartseat-panel-text">
-            Estimated share of seats that are free in the study room
+            Estimated chance that at least one table has
+            {seats_needed} free seat(s)
         </div>
         <div style="font-size:64px;font-weight:800;color:{DEEP_GREEN};
                     line-height:1.1;margin:10px 0;">{percent}%</div>
@@ -922,16 +1147,14 @@ def display_visit_forecast(visit_date, visit_time):
             <span>{weekday_name}, {visit_date:%d %b %Y}, {visit_time:%H:%M}</span></div>
         <div class="smartseat-row"><span>Time window</span>
             <span>{weekday_name}s, {start} to {end}</span></div>
-        <div class="smartseat-row"><span>Expected free seats</span>
-            <span>about {expected_free} of {all_seats}</span></div>
         {based_on_row}
         <div class="smartseat-panel-text"
              style="background:#faf8f4;border-radius:8px;padding:12px;
                     margin-top:14px;">
             This is an estimate from past patterns, not a reservation or
-            a guarantee. It is the average share of free seats in the whole
-            room, not a promise that seats are free together at one table.
-            It does not know about exams, holidays or events.
+            a guarantee. Free seats are counted as rated capacity minus
+            people detected at each table. It does not know about exams,
+            holidays or events.
         </div>
     </div>
     """)
@@ -962,7 +1185,8 @@ with st.sidebar:
             "Find Available Seats",
             "About SmartSeat"
         ],
-        label_visibility="visible"
+        label_visibility="visible",
+        key="nav_page"
     )
 
     st.divider()
@@ -986,9 +1210,6 @@ with st.sidebar:
         + ("Connected" if CAMERA_CONNECTED else "Not connected")
     )
     st.caption(f"Data mode: {DATA_MODE_TEXT[DATA_SOURCE]}")
-    st.caption(
-        "Database: " + ("Connected" if db is not None else "Not found")
-    )
 
     auto_refresh = st.toggle("Auto-refresh every 10 s", value=False)
 
@@ -1064,7 +1285,7 @@ if page == "Overview":
 
     st.markdown("---")
 
-    picker_column, _spacer = st.columns([1, 2])
+    picker_column, time_column, _spacer = st.columns([1, 1.4, 0.6])
 
     with picker_column:
 
@@ -1073,6 +1294,16 @@ if page == "Overview":
             list(table_data.keys()),
             key="overview_selected_table"
         )
+
+    with time_column:
+
+        if video_frames:
+            st.select_slider(
+                "Video time",
+                options=[frame["second"] for frame in video_frames],
+                key="video_second",
+                format_func=lambda second: f"{second:.0f} s"
+            )
 
     photo_column, map_column = st.columns(2)
 
@@ -1123,8 +1354,8 @@ if page == "Overview":
         ])
 
         st.caption(
-            "Free seats are read from the database; people detected = "
-            "seats minus free seats. It is not chair-by-chair detection."
+            "Free seats = rated capacity minus people detected. "
+            "It is an estimate, not chair-by-chair detection."
         )
 
     with status_column:
@@ -1132,11 +1363,7 @@ if page == "Overview":
         st.markdown("### Detection Status")
 
         display_status_rows("Detection Status", [
-            ("YOLO detection",
-             status_badge(
-                 DETECTION_STATUS.upper(),
-                 "ok" if CAMERA_CONNECTED else "off"
-             )),
+            ("YOLO detection", status_badge(DETECTION_STATUS.upper(), "off")),
             ("Camera connection", camera_badge()),
             ("Data source", source_badge()),
             ("Last detection update", escape(last_update_text())),
@@ -1282,7 +1509,6 @@ elif page == "Analytics":
 
         history_frame = pd.DataFrame(history)
         history_frame["time"] = history_frame["time"].apply(to_local_naive)
-        history_frame = history_frame.dropna(subset=["time"])
 
         st.line_chart(
             history_frame,
@@ -1371,6 +1597,14 @@ elif page == "Find Available Seats":
                 step=900
             )
 
+            seats_needed = st.number_input(
+                "Seats needed (together at one table)",
+                min_value=1,
+                max_value=max(TABLE_CAPACITY.values()),
+                value=1,
+                step=1
+            )
+
             submitted = st.form_submit_button("Check availability")
 
         st.caption(
@@ -1379,7 +1613,9 @@ elif page == "Find Available Seats":
         )
 
     if submitted:
-        st.session_state.seat_request = (visit_date, visit_time)
+        st.session_state.seat_request = (
+            visit_date, visit_time, int(seats_needed)
+        )
 
     with result_column:
 
@@ -1388,18 +1624,16 @@ elif page == "Find Available Seats":
         if request is None:
             display_panel(
                 "Estimated availability",
-                "Choose a date and an arrival time, then select "
-                "Check availability."
+                "Choose a date, an arrival time and how many seats you "
+                "need, then select Check availability."
             )
         else:
-            display_visit_forecast(*request[:2])
+            display_visit_forecast(*request)
 
     st.info(
         "The estimate uses past occupancy readings stored in the "
-        "database, on the same weekday and within "
-        f"{AVAILABILITY_WINDOW_MINUTES} minutes of the chosen time. "
-        f"With fewer than {MIN_FORECAST_READINGS} readings, no number "
-        "is shown."
+        "database, around the same weekday and time. With too little "
+        "history, no number is shown."
     )
 
     st.caption(
@@ -1432,9 +1666,9 @@ elif page == "About SmartSeat":
 
     with step1:
         display_panel(
-            "01 — Image Input",
-            "Photos of the study area, taken from one fixed viewpoint, "
-            "are the input to the detector."
+            "01 — Image or Video Input",
+            "Photos or video of the study area, taken from one fixed "
+            "viewpoint, are the input to the detector."
         )
         display_panel(
             "02 — Computer Vision",
@@ -1445,8 +1679,8 @@ elif page == "About SmartSeat":
     with step2:
         display_panel(
             "03 — Data Storage",
-            "The free seats of each table are stored with a timestamp "
-            "in a SQLite database."
+            "Table-level counts are stored with a timestamp in a SQLite "
+            "database."
         )
         display_panel(
             "04 — Smart Dashboard",
@@ -1491,14 +1725,15 @@ elif page == "About SmartSeat":
         "**Availability forecast:** "
         + (
             "Connected"
-            if db is not None and hasattr(db, "predict_availability")
+            if smartseat_db is not None
+            and hasattr(smartseat_db, "predict_availability")
             else "Not connected"
         )
     )
 
     st.info(
         "SmartSeat is a prototype. Numbers are labelled by source: "
-        "DEMO, REPLAY or LIVE. Only seat counts are stored. No "
+        "DEMO, REPLAY or LIVE. Only people counts are stored. No "
         "images or faces are kept."
     )
 
